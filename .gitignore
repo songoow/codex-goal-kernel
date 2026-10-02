@@ -1,0 +1,5 @@
+node_modules/
+.goal-kernel/
+.local/
+coverage/
+*.tsbuildinfo

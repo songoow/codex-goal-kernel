@@ -1,9 +1,19 @@
 # Codex Goal Kernel
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A standalone TypeScript project for running bounded Codex CLI turns with
 revalidated acceptance and persistent progress. It is an experimental runner
 for one local goal, with its own state, CLI and tests. No LoopX installation or
 repository is required. It does not drive Codex’s native Goal API.
+
+## Why this design
+
+The kernel keeps one goal explicit, rechecks acceptance against the workspace,
+and credits each checkpoint once. These choices address stale success and
+repeated activity being mistaken for progress. The rationale, tradeoffs and
+evidence limits are explained in [Design rationale](docs/design.md)
+([设计说明](docs/design.zh-CN.md)).
 
 ## Running the package
 
@@ -22,8 +32,9 @@ node --experimental-strip-types src/cli.ts view --project "$PROJECT_DIR" --id gr
 ```
 
 State, the declaration, receipts and the text view stay under the selected
-project's ignored `.goal-kernel/` directory. Repeated `init` is rejected so
-it cannot erase a goal's budget or acceptance. Use a new id for a new experiment.
+project’s `.goal-kernel/` directory. This repository ignores that directory;
+when using another Git project, add it to that project’s ignore rules.
+Repeated `init` is rejected so it cannot erase a goal's budget or acceptance. Use a new id for a new experiment.
 The JSON spec's `goal_id` must match `--id`.
 
 The runtime defaults to `workspace-write`. `--sandbox read-only` is available

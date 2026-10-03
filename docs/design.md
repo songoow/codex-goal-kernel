@@ -142,8 +142,13 @@ Each goal lives under `.goal-kernel/goals/<id>/`:
 
 This keeps the single-writer experiment easy to inspect and copy. A fresh kernel
 process can read its saved state and request continuation of the recorded Codex
-session. It still depends on that session being available to Codex. State files
-are not a replacement for the provider's conversation history.
+session. If the provider no longer has that thread, the kernel discards the
+binding and carries the same rendered turn on a new thread, once, because the
+prompt is rebuilt from state rather than from the thread. What is lost in that
+case is only the model's hidden working memory. Under `fresh` continuity nothing
+is ever resumed, so the question does not arise. State files still do not
+replace the provider's conversation history; they decide what the loop does
+when that history is unavailable.
 
 The adapter uses JSON events and a structured final response from the existing
 CLI. This gives the kernel a concrete execution path with a small integration
@@ -174,18 +179,55 @@ no concurrency fence.
 These boundaries reduce implementation and evaluation scope. They leave real
 limitations: a stopped goal has no general recovery command, and the caller
 must handle scheduling and operational repair. There is a total turn limit and
-a consecutive-idle limit, but no enforced token or wall-clock budget. Reported
-provider usage is observational and its cumulative-versus-delta semantics still
-need qualification.
+a consecutive-idle limit; token and wall-clock ceilings are optional, and the
+clock starts at the first admitted model call rather than at `init`, so an
+idle goal does not age. Reported provider usage is observational and its
+cumulative-versus-delta semantics still need qualification, which is why the
+token ceiling is described as able to fire early but never late.
 
-## 9. What would justify stronger claims
+## 9. Where continuity lives, and why that is a measured condition
+
+Memory between turns can live in the provider's thread or in the kernel's
+state. The first version of this kernel chose the thread: every turn resumed
+the same Codex session. LoopX's published LHTB arm made the opposite choice,
+one fresh `codex exec` per heartbeat and never a resume, with the stated aim
+that the next wake starts from recorded state rather than stale chat memory.
+Neither project has shown which choice produces more accepted work over a long
+run, and this repository should not pretend otherwise.
+
+So `policy.continuity` is a frozen per-goal condition with two values. Under
+`resume` the model keeps its hidden working memory; under `fresh` the rendered
+state and the workspace are the only memory. Three decisions make the two arms
+comparable:
+
+| Decision | Reason |
+| --- | --- |
+| Both modes render identical prompt sections except the opening line. | A comparison should vary one thing: the hidden thread history. |
+| Every prompt carries a bounded tail of the last five turns, in both modes. | A fresh thread needs to know what was tried; giving it only to `fresh` would confound the comparison, and an unbounded narrative would reintroduce prose-driven drift. |
+| Lost-thread recovery exists regardless of mode. | A `resume` goal should not die because the provider forgot a thread when the kernel can rebuild the turn from state. Recovery is bounded to one fresh retry per turn and recorded in the receipt. |
+
+The ablation runner in [`examples/ablation.ts`](../examples/ablation.ts) runs
+one task under matched model, sandbox and turn budget across the two kernel
+modes and two native baselines, and judges every arm with the same independent
+checks. It reports completion, turns, idle turns, regressions of previously
+passing checks, recoveries and reported tokens. It also states its own
+unfairness: native arms stop early when the independent checks pass, which is
+an oracle the model does not see. Small samples on the bundled toy tasks
+validate the pipeline; they do not answer the question. Real tasks, repeated
+runs and reported uncertainty would.
+
+## 10. What would justify stronger claims
 
 The [reliability tests](../tests/reliability.test.ts) cover stale acceptance,
-repeated credit, restart behavior, goal edits and terminal precedence. The
-[live smoke](../examples/live-smoke.ts) exercises five separate kernel processes
-on one Codex session, external regression and repair, last-turn completion, and
-rejection of stale success. It deliberately requests one checkpoint per turn
-to exercise continuation; it is not a realistic long-task benchmark.
+repeated credit, restart behavior, goal edits and terminal precedence; the
+[continuity tests](../tests/continuity.test.ts) cover lost-thread
+classification and bounded recovery, `fresh` mode and the bounded recent-turn
+tail; the [budget tests](../tests/budget.test.ts) cover the optional token and
+wall-clock ceilings. The [live smoke](../examples/live-smoke.ts) exercises five
+separate kernel processes on one Codex session, external regression and repair,
+a lost thread recovered on a new thread, last-turn completion, and rejection of
+stale success. It deliberately requests one checkpoint per turn to exercise
+continuation; it is not a realistic long-task benchmark.
 
 The intended trust model is a cooperative local operator and agent. An agent
 with workspace write access can also affect state or checker files. Owner CLI

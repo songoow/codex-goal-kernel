@@ -1,3 +1,4 @@
+import { continuityOf, tokensUsed } from "./invariants.ts";
 import type { Goal, KernelState, StopRecord } from "./types.ts";
 
 /** Deterministic projection of (goal, state, journal tail) into the VIEW.md file. */
@@ -7,17 +8,23 @@ export function renderView(
   receipts: Array<Record<string, unknown>>,
 ): string {
   const satisfied = new Set(state.verified_predicates);
+  const recoveries = receipts.filter((r) => typeof r.session_recovery === "object" && r.session_recovery !== null).length;
   const lines: string[] = [];
   lines.push(`# ${goal.goal_id}`);
   lines.push("");
   lines.push(`- status: **${state.status}**`);
   lines.push(`- goal hash: \`${state.goal_hash}\``);
+  lines.push(`- continuity: ${continuityOf(goal)}`);
   lines.push(`- turns spent: ${state.turn_count} / ${goal.policy.max_turns}`);
   lines.push(`- no-progress streak: ${state.no_progress_streak} / ${goal.policy.max_idle_turns}`);
-  lines.push(`- codex session: \`${state.session_id ?? "(none yet)"}\``);
+  lines.push(`- codex session: \`${state.session_id ?? "(none yet)"}\`${recoveries ? ` (recovered ${recoveries} time${recoveries === 1 ? "" : "s"} after a lost thread)` : ""}`);
   lines.push(
-    `- tokens: in ${state.usage_total.input_tokens} (cached ${state.usage_total.cached_input_tokens}), out ${state.usage_total.output_tokens}`,
+    `- tokens: in ${state.usage_total.input_tokens} (cached ${state.usage_total.cached_input_tokens}), out ${state.usage_total.output_tokens}` +
+    (goal.policy.max_total_tokens !== undefined ? ` — ${tokensUsed(state)} of ${goal.policy.max_total_tokens} budgeted` : ""),
   );
+  if (goal.policy.max_wallclock_ms !== undefined) {
+    lines.push(`- wall-clock budget: ${goal.policy.max_wallclock_ms} ms from ${state.started_at ?? "(first admitted turn)"}`);
+  }
   lines.push("");
   if (state.stop) lines.push(renderStop(state.stop));
   lines.push(`## Objective`);
@@ -75,6 +82,7 @@ function formatReceiptLine(receipt: Record<string, unknown>): string {
     : [];
   const ok = verified.filter((v) => v.ok).map((v) => v.predicate);
   const upgraded = Array.isArray(receipt.admitted_todos) ? (receipt.admitted_todos as string[]) : [];
+  const session = receipt.session_recovery ? "recovered" : receipt.session_reused ? "resumed" : "fresh";
   const note = typeof receipt.note === "string" && receipt.note ? ` note=${JSON.stringify(receipt.note.slice(0, 120))}` : "";
-  return `${receipt.at} turn ${receipt.turn_index} claimed=[${closed.join(",")}] verified=[${ok.join(",")}] new=${upgraded.length} progress=${receipt.progress ? "yes" : "no"}${note}`;
+  return `${receipt.at} turn ${receipt.turn_index} session=${session} claimed=[${closed.join(",")}] verified=[${ok.join(",")}] new=${upgraded.length} progress=${receipt.progress ? "yes" : "no"}${note}`;
 }

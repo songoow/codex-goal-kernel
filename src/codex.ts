@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TurnDelta, Usage } from "./types.ts";
@@ -8,11 +8,15 @@ import type { TurnDelta, Usage } from "./types.ts";
  * The Codex adapter — the one non-trivial piece of real engineering here.
  *
  * It shells out to `codex exec` and drives continuation with `resume <thread_id>`.
- * The three facts it relies on are verified against the installed CLI:
+ * The facts it relies on are verified against the installed CLI (0.160.0):
  *   - `--json` emits a JSONL event stream (`thread.started`, `turn.completed`);
  *   - `resume <SESSION_ID>` continues the same thread, so the model keeps its
  *     own working context and the kernel does not have to replay history;
- *   - `--output-schema` makes the final message a validated JSON object.
+ *   - `--output-schema` makes the final message a validated JSON object;
+ *   - `resume` rejects `--sandbox` and does not inherit the original thread's
+ *     sandbox, so the policy is restated through `-c sandbox_mode=...` on every turn;
+ *   - resuming a thread the provider no longer has exits non-zero with no
+ *     events and `thread/resume failed: no rollout found for thread id ...`.
  *
  * A production rewrite would speak the app-server RPC protocol directly for
  * streaming and interrupt control. A subprocess per turn is the honest minimum
@@ -40,6 +44,54 @@ export interface CodexTurnResult {
   sessionReused: boolean;
   usage: Usage;
   durationMs: number;
+}
+
+/** A completed exec without the structured delta contract. Used by the ablation runner's native arms. */
+export interface CodexPromptResult {
+  sessionId: string | null;
+  sessionReused: boolean;
+  usage: Usage;
+  finalMessage: string | null;
+  durationMs: number;
+}
+
+/**
+ * Failure classes the kernel acts on. `session_missing` mirrors the name LoopX's
+ * Codex adapter uses for a resume whose thread the provider no longer has; it is
+ * the only class that changes control flow (discard the binding, start fresh).
+ */
+export type TurnFailureCategory = "session_missing" | "unknown";
+
+export class CodexTurnError extends Error {
+  readonly category: TurnFailureCategory;
+  readonly exitCode: number | null;
+  constructor(message: string, category: TurnFailureCategory, exitCode: number | null = null) {
+    super(message);
+    this.name = "CodexTurnError";
+    this.category = category;
+    this.exitCode = exitCode;
+  }
+}
+
+/**
+ * Text classification of a failed turn. This is a documented heuristic over
+ * provider error text, not a typed contract: it fires only when a *resume*
+ * produced no thread at all and the error names a missing rollout, thread or
+ * session. Authentication wording wins, because a fresh retry cannot fix it.
+ */
+export function classifyTurnFailure(input: {
+  resumed: boolean;
+  sessionStarted: boolean;
+  completed: boolean;
+  stderr: string;
+  eventError: string | null;
+}): TurnFailureCategory {
+  if (!input.resumed || input.sessionStarted || input.completed) return "unknown";
+  const text = `${input.eventError ?? ""}\n${input.stderr}`.toLowerCase();
+  if (/unauthorized|authentication|login required|invalid_api_key/.test(text)) return "unknown";
+  if (text.includes("no rollout found for thread id")) return "session_missing";
+  if (/(thread|session)[^\n]{0,40}not found/.test(text)) return "session_missing";
+  return "unknown";
 }
 
 /** Mirrors `TurnDelta` in types.ts. A smoke test asserts the two agree. */
@@ -103,52 +155,75 @@ export function deltaJsonSchema(): Record<string, unknown> {
   };
 }
 
+/** One kernel turn: structured delta required. */
 export async function runCodexTurn(request: CodexTurnRequest): Promise<CodexTurnResult> {
   const started = Date.now();
   const scratch = mkdtempSync(join(tmpdir(), "goal-kernel-"));
-  const schemaPath = join(scratch, "delta.schema.json");
-  const lastMessagePath = join(scratch, "last-message.json");
-  writeFileSync(schemaPath, JSON.stringify(deltaJsonSchema()), "utf8");
-
-  const args = buildArgs(request, schemaPath, lastMessagePath);
-  const { stdout, stderr, code } = await run("codex", args, request.projectRoot, request.timeoutMs ?? 30 * 60_000);
-
-  const events = parseEvents(stdout);
-  const sessionId = events.sessionId;
-  const usage = events.usage;
-
-  if (!events.completed) {
-    const tail = stderr.trim().slice(-800);
-    throw new Error(
-      `codex turn did not complete (exit ${code}): ${events.error ?? (tail || "no event stream")}`,
-    );
+  try {
+    const schemaPath = join(scratch, "delta.schema.json");
+    const lastMessagePath = join(scratch, "last-message.json");
+    writeFileSync(schemaPath, JSON.stringify(deltaJsonSchema()), "utf8");
+    const { events } = await execCodex(request, { schemaPath, lastMessagePath });
+    const raw = readLastMessage(lastMessagePath, events.finalMessage);
+    return {
+      delta: parseDelta(raw),
+      sessionId: events.sessionId,
+      sessionReused: request.sessionId !== null && events.sessionId === request.sessionId,
+      usage: events.usage,
+      durationMs: Date.now() - started,
+    };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
+}
 
-  const raw = readLastMessage(lastMessagePath, events.finalMessage);
-  const delta = parseDelta(raw);
+/** One plain exec or resume with no output contract. */
+export async function runCodexPrompt(request: CodexTurnRequest): Promise<CodexPromptResult> {
+  const started = Date.now();
+  const { events } = await execCodex(request, null);
   return {
-    delta,
-    sessionId,
-    sessionReused: request.sessionId !== null && sessionId === request.sessionId,
-    usage,
+    sessionId: events.sessionId,
+    sessionReused: request.sessionId !== null && events.sessionId === request.sessionId,
+    usage: events.usage,
+    finalMessage: events.finalMessage,
     durationMs: Date.now() - started,
   };
 }
 
-function buildArgs(
+async function execCodex(
   request: CodexTurnRequest,
-  schemaPath: string,
-  lastMessagePath: string,
+  structured: { schemaPath: string; lastMessagePath: string } | null,
+): Promise<{ events: ParsedEvents; stderr: string }> {
+  const args = buildArgs(request, structured);
+  const { stdout, stderr, code } = await run("codex", args, request.projectRoot, request.timeoutMs ?? 30 * 60_000);
+  const events = parseEvents(stdout);
+  if (!events.completed) {
+    const tail = stderr.trim().slice(-800);
+    const category = classifyTurnFailure({
+      resumed: request.sessionId !== null,
+      sessionStarted: events.sessionId !== null,
+      completed: false,
+      stderr,
+      eventError: events.error,
+    });
+    throw new CodexTurnError(
+      `codex turn did not complete (exit ${code}): ${events.error ?? (tail || "no event stream")}`,
+      category,
+      code,
+    );
+  }
+  return { events, stderr };
+}
+
+export function buildArgs(
+  request: CodexTurnRequest,
+  structured: { schemaPath: string; lastMessagePath: string } | null,
 ): string[] {
-  const common = [
-    "--json",
-    "--output-schema",
-    schemaPath,
-    "--output-last-message",
-    lastMessagePath,
-    "--skip-git-repo-check",
-  ];
-  // Use a config override accepted by both exec and resume, on every turn.
+  const common = ["--json", "--skip-git-repo-check"];
+  if (structured) {
+    common.push("--output-schema", structured.schemaPath, "--output-last-message", structured.lastMessagePath);
+  }
+  // Restated on every turn: `resume` rejects --sandbox and does not inherit the thread's policy.
   const sandbox = [`-c`, `sandbox_mode=${JSON.stringify(request.sandbox ?? "workspace-write")}`];
   const model = request.model ? ["--model", request.model] : [];
   if (request.sessionId) {
@@ -165,7 +240,7 @@ interface ParsedEvents {
   error: string | null;
 }
 
-function parseEvents(stdout: string): ParsedEvents {
+export function parseEvents(stdout: string): ParsedEvents {
   const out: ParsedEvents = {
     sessionId: null,
     usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
@@ -259,6 +334,7 @@ function run(
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {
+    // stdin is closed on purpose: a piped stdin makes `codex exec` wait for more input.
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";

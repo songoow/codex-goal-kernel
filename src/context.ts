@@ -1,8 +1,12 @@
 import { hashValue } from "./hash.ts";
+import { continuityOf, tokensUsed } from "./invariants.ts";
 import type { Goal, KernelState, Todo } from "./types.ts";
 
 /** Render the explicit goal prompt deterministically. Codex session history and
- * workspace inputs are separate; this hash alone cannot replay a past turn. */
+ * workspace inputs are separate; this hash alone cannot replay a past turn.
+ *
+ * Both continuity modes receive the same sections. Only the opening line differs,
+ * so an ablation between them varies exactly one thing: the hidden thread memory. */
 export interface RenderedContext {
   prompt: string;
   ctx_hash: string;
@@ -12,9 +16,12 @@ export function renderContext(goal: Goal, state: KernelState): RenderedContext {
   const open = state.todos.filter((t) => t.status === "open");
   const blocked = state.todos.filter((t) => t.status === "blocked");
   const satisfied = new Set(state.verified_predicates);
+  const recent = state.recent_turns ?? [];
 
   const lines: string[] = [];
-  lines.push("You are continuing one long-running goal. Work exactly one bounded step, then report.");
+  lines.push(continuityOf(goal) === "fresh"
+    ? "You are continuing one long-running goal in a new session with no memory of earlier turns. Everything known is below and in the workspace. Work exactly one bounded step, then report."
+    : "You are continuing one long-running goal. Work exactly one bounded step, then report.");
   lines.push("");
   lines.push(`## Objective (frozen, hash ${state.goal_hash.slice(0, 12)})`);
   lines.push(goal.objective);
@@ -48,7 +55,20 @@ export function renderContext(goal: Goal, state: KernelState): RenderedContext {
     }
   }
   lines.push("");
-  lines.push(`## Budget remaining: ${Math.max(0, goal.policy.max_turns - state.turn_count)} of ${goal.policy.max_turns} turns`);
+  lines.push(`## Recent turns (oldest first; what the harness verified, then that turn's own note)`);
+  if (recent.length === 0) {
+    lines.push("- (none yet)");
+  } else {
+    for (const turn of recent) {
+      lines.push(`- turn ${turn.turn_index}: progress=${turn.progress ? "yes" : "no"} verified=[${turn.verified_new.join(",")}] note=${JSON.stringify(turn.note)}`);
+    }
+  }
+  lines.push("");
+  const budget = [`${Math.max(0, goal.policy.max_turns - state.turn_count)} of ${goal.policy.max_turns} turns`];
+  if (goal.policy.max_total_tokens !== undefined) {
+    budget.push(`${Math.max(0, goal.policy.max_total_tokens - tokensUsed(state))} of ${goal.policy.max_total_tokens} tokens`);
+  }
+  lines.push(`## Budget remaining: ${budget.join("; ")}`);
   if (state.no_progress_streak > 0) {
     lines.push(`## Warning: ${state.no_progress_streak} consecutive turn(s) verified no new checkpoint. The run stops after ${goal.policy.max_idle_turns}.`);
   }

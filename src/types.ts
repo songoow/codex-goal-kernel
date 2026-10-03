@@ -56,11 +56,28 @@ export interface Assumption {
   source: AssumptionSource;
 }
 
+/**
+ * Where continuity lives between turns.
+ *
+ * `resume` continues one Codex thread, so the model also keeps its private
+ * working memory. `fresh` starts a new thread every turn, so the rendered
+ * state and the workspace are the only memory. Both modes receive the same
+ * explicit prompt; the difference is the hidden thread history.
+ */
+export const CONTINUITY_MODES = ["resume", "fresh"] as const;
+export type ContinuityMode = (typeof CONTINUITY_MODES)[number];
+
 export interface GoalPolicy {
   /** Hard ceiling on Codex turns for this goal. */
   max_turns: number;
   /** Consecutive turns with no verified progress before the loop stops and asks. */
   max_idle_turns: number;
+  /** Absent means `resume`. Frozen with the goal because it is an experimental condition. */
+  continuity?: ContinuityMode;
+  /** Optional ceiling on summed reported input plus output tokens across the goal. */
+  max_total_tokens?: number;
+  /** Optional ceiling on elapsed time since the first admitted model call. */
+  max_wallclock_ms?: number;
 }
 
 /** The frozen declaration. `goal_hash` covers the canonical form of exactly this object. */
@@ -136,6 +153,16 @@ export interface PendingDecision {
   proposal: { objective: string; reason: string };
 }
 
+/** One line of the bounded history rendered into every prompt. */
+export interface RecentTurn {
+  turn_index: number;
+  progress: boolean;
+  verified_new: PredicateId[];
+  note: string;
+}
+
+export const RECENT_TURNS_LIMIT = 5;
+
 export const KERNEL_STATUSES = ["running", "done", "stopped"] as const;
 export type KernelStatus = (typeof KERNEL_STATUSES)[number];
 
@@ -144,7 +171,7 @@ export interface KernelState {
   goal_id: GoalId;
   /** Frozen at init. Any later mismatch is a hard stop, not a re-read. */
   goal_hash: string;
-  /** Codex thread to resume; null before the first turn. */
+  /** Codex thread to resume; null before the first turn and always null under `fresh` continuity. */
   session_id: string | null;
   turn_count: number;
   usage_total: Usage;
@@ -158,12 +185,23 @@ export interface KernelState {
   no_progress_streak: number;
   status: KernelStatus;
   stop: StopRecord | null;
+  /** ISO time of the first admitted model call. Optional for reading earlier state. */
+  started_at?: string | null;
+  /** Bounded tail of what recent turns did. Optional for reading earlier state. */
+  recent_turns?: RecentTurn[];
 }
 
 export interface VerifiedPredicate {
   predicate: PredicateId;
   ok: boolean;
   evidence: string;
+}
+
+/** Recorded when a resume failed because the provider no longer has the thread. */
+export interface SessionRecovery {
+  lost_session_id: string;
+  reason: "session_missing";
+  detail: string;
 }
 
 /** One appended line of `journal.jsonl`. */
@@ -173,8 +211,10 @@ export interface TurnReceipt {
   turn_index: number;
   goal_hash: string;
   ctx_hash: string;
+  continuity: ContinuityMode;
   session_id: string | null;
   session_reused: boolean;
+  session_recovery: SessionRecovery | null;
   usage: Usage;
   closed: PredicateId[];
   verified: VerifiedPredicate[];

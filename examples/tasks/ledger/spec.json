@@ -1,0 +1,13 @@
+{
+  "goal_id": "ledger",
+  "objective": "Build a small Python package named ledger in this project. ledger/__init__.py must export a class Ledger with add(account: str, amount: int), balance() -> int (sum of all amounts), by_account() -> dict[str, int], save(path) writing JSON, and a classmethod load(path) that restores a saved ledger. Add ledger/cli.py so that `python3 -m ledger.cli demo` adds cash 5 and cash -2 to a new ledger and prints exactly `balance=3`. Add test_ledger.py at the project root that exercises all of the above and prints OK on success. Use only the standard library.",
+  "predicates": [
+    { "id": "p1", "statement": "ledger/__init__.py exists", "verify": { "kind": "file_exists", "path": "ledger/__init__.py" } },
+    { "id": "p2", "statement": "balance() sums amounts", "verify": { "kind": "command", "run": "python3 -c \"from ledger import Ledger; l=Ledger(); l.add('cash',5); l.add('cash',-2); print(l.balance())\"", "expect_stdout": "3", "timeout_ms": 30000 } },
+    { "id": "p3", "statement": "by_account() groups amounts per account", "verify": { "kind": "command", "run": "python3 -c \"from ledger import Ledger; l=Ledger(); l.add('a',5); l.add('b',7); l.add('a',1); d=l.by_account(); print(d['a'], d['b'])\"", "expect_stdout": "6 7", "timeout_ms": 30000 } },
+    { "id": "p4", "statement": "save() then load() round-trips", "verify": { "kind": "command", "run": "python3 -c \"import os,tempfile; from ledger import Ledger; l=Ledger(); l.add('x',10); p=os.path.join(tempfile.mkdtemp(),'l.json'); l.save(p); m=Ledger.load(p); print(m.balance())\"", "expect_stdout": "10", "timeout_ms": 30000 } },
+    { "id": "p5", "statement": "the demo command prints balance=3", "verify": { "kind": "command", "run": "python3 -m ledger.cli demo", "expect_stdout": "balance=3", "timeout_ms": 30000 } },
+    { "id": "p6", "statement": "test_ledger.py passes and prints OK", "verify": { "kind": "command", "run": "python3 test_ledger.py", "expect_stdout": "OK", "timeout_ms": 60000 } }
+  ],
+  "policy": { "max_turns": 8, "max_idle_turns": 3 }
+}

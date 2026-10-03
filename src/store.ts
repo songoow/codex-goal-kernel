@@ -61,6 +61,8 @@ export class GoalStore {
       no_progress_streak: 0,
       status: "running",
       stop: null,
+      started_at: null,
+      recent_turns: [],
     };
     atomicWriteJson(this.statePath, state);
     return { created: true, goal_hash };
@@ -76,9 +78,12 @@ export class GoalStore {
     };
   }
 
+  /** Earlier state files lack the optional fields; defaults are applied in memory only. */
   readState(): KernelState {
     const state = readJson<KernelState>(this.statePath);
     state.credited_predicates ??= [...state.verified_predicates];
+    state.started_at ??= null;
+    state.recent_turns ??= [];
     return state;
   }
 

@@ -1,6 +1,7 @@
 import { hashValue, sha256File } from "./hash.ts";
 import type {
   Assumption,
+  ContinuityMode,
   Goal,
   KernelState,
   StopReason,
@@ -92,15 +93,35 @@ export function checkAssumptions(
   return { ok: violations.length === 0, violations, stale_assumptions: stale };
 }
 
-/** 3. Budget and owner authority. */
-export function checkBudget(goal: Goal, state: KernelState): Violation[] {
-  if (state.turn_count >= goal.policy.max_turns) {
-    return [
-      {
+/** Summed input plus output tokens as reported by the provider. Cached input is part of input. */
+export function tokensUsed(state: KernelState): number {
+  return state.usage_total.input_tokens + state.usage_total.output_tokens;
+}
+
+/**
+ * 3. Budgets. Turns are always bounded; tokens and wall-clock are optional
+ * ceilings. The clock is injected so the rule can be tested; the kernel still
+ * does not decide when it runs, only whether it may.
+ */
+export function checkBudget(goal: Goal, state: KernelState, nowMs: number = Date.now()): Violation[] {
+  const policy = goal.policy;
+  if (state.turn_count >= policy.max_turns) {
+    return [{ reason: "budget_exhausted", detail: `turn budget ${policy.max_turns} reached` }];
+  }
+  if (policy.max_total_tokens !== undefined && tokensUsed(state) >= policy.max_total_tokens) {
+    return [{
+      reason: "budget_exhausted",
+      detail: `token budget ${policy.max_total_tokens} reached (reported ${tokensUsed(state)} input+output tokens)`,
+    }];
+  }
+  if (policy.max_wallclock_ms !== undefined && state.started_at) {
+    const elapsed = nowMs - Date.parse(state.started_at);
+    if (elapsed >= policy.max_wallclock_ms) {
+      return [{
         reason: "budget_exhausted",
-        detail: `turn budget ${goal.policy.max_turns} reached`,
-      },
-    ];
+        detail: `wall-clock budget ${policy.max_wallclock_ms} ms reached (${elapsed} ms since the first admitted turn)`,
+      }];
+    }
   }
   return [];
 }
@@ -126,13 +147,14 @@ export function checkInvariants(
   goal: Goal,
   state: KernelState,
   projectRoot: string,
+  nowMs: number = Date.now(),
 ): InvariantReport {
   const scoping = checkTodoScoping(goal, state.todos);
   const assumptions = checkAssumptions(projectRoot, state.assumptions);
   const violations = [
     ...scoping,
     ...assumptions.violations,
-    ...checkBudget(goal, state),
+    ...checkBudget(goal, state, nowMs),
     ...checkProgress(goal, state),
   ];
   return {
@@ -150,6 +172,11 @@ export function isGoalComplete(goal: Goal, state: KernelState): boolean {
   if (goal.predicates.length === 0) return false;
   const done = new Set(state.verified_predicates);
   return goal.predicates.every((p) => done.has(p.id));
+}
+
+/** Absent continuity means `resume`; the stored declaration is not rewritten, so old hashes stay valid. */
+export function continuityOf(goal: Goal): ContinuityMode {
+  return goal.policy.continuity ?? "resume";
 }
 
 /** Counter helper used by the loop: hash of the parts a turn must not change. */

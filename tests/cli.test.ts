@@ -69,3 +69,22 @@ test("CLI owner acceptance cannot bypass automatic checks; completion and regres
   assert.match(h.run("view").text, /\[ \] \*\*a\*\*/);
   assert.equal(JSON.parse(readFileSync(h.statePath, "utf8")).turn_count, 0);
 });
+
+test("CLI init validates continuity and the optional budgets, and status reads them back", t => {
+  const h = fixture(t);
+  writeFileSync(h.specPath, JSON.stringify({ ...h.spec, policy: { ...h.spec.policy, continuity: "sticky" } }));
+  assert.match(h.run("init", ["--spec", h.specPath]).text, /continuity must be one of resume, fresh/);
+  for (const bad of [{ max_total_tokens: 0 }, { max_total_tokens: 1.5 }, { max_wallclock_ms: "soon" }, { max_wallclock_ms: -1 }]) {
+    writeFileSync(h.specPath, JSON.stringify({ ...h.spec, policy: { ...h.spec.policy, ...bad } }));
+    assert.equal(h.run("init", ["--spec", h.specPath]).code, 1, JSON.stringify(bad));
+  }
+  writeFileSync(h.specPath, JSON.stringify({ ...h.spec, policy: { ...h.spec.policy, continuity: "fresh", max_total_tokens: 5000, max_wallclock_ms: 3600000 } }));
+  const init = h.run("init", ["--spec", h.specPath]);
+  assert.equal(init.code, 0, init.text);
+  assert.match(init.text, /continuity: fresh/);
+  const status = h.run("status").text;
+  assert.match(status, /continuity=fresh/);
+  assert.match(status, /budget=0\/5000/);
+  assert.match(status, /wallclock_budget_ms=3600000/);
+  assert.match(h.run("view").text, /- continuity: fresh/);
+});

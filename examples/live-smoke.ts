@@ -1,7 +1,11 @@
 #!/usr/bin/env -S node --no-warnings --experimental-strip-types
-/** Real CLI continuation and regression-recovery smoke. Spends model tokens.
+/** Real CLI continuation, regression-recovery and lost-thread smoke. Spends model tokens.
  * Synthetic work is deliberately split across turns to exercise the protocol;
- * passing this check is not long-horizon performance evidence. */
+ * passing this check is not long-horizon performance evidence.
+ *
+ * The lost-thread step does not touch the user's real sessions: it rewrites the
+ * stored session id to a well-formed id Codex has never seen, which yields the
+ * same `no rollout found for thread id` failure as a deleted rollout. */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -43,16 +47,30 @@ try {
   }));
   const init = run("init", ["--spec", spec]);
   assert.equal(init.code, 0, init.output);
+  const BOGUS = "01a10000-0000-7000-8000-00000000dead";
   let session: string | null = null;
   for (let turn = 1; turn <= 5; turn++) {
+    if (turn === 3) {
+      // Simulate the provider losing the thread between two kernel processes.
+      const state = readState();
+      state.session_id = BOGUS;
+      writeFileSync(join(data, "state.json"), JSON.stringify(state));
+    }
     // Each invocation is a new kernel process resuming the persisted Codex session.
     const result = run("run", ["--turns", "1", "--sandbox", sandbox]);
     assert.equal(result.code, 0, result.output);
     const state = readState();
     assert.equal(state.turn_count, turn);
     assert.ok(state.session_id);
-    session ??= state.session_id;
-    assert.equal(state.session_id, session);
+    if (turn === 3) {
+      assert.notEqual(state.session_id, BOGUS, "the lost binding must be replaced, not kept");
+      assert.notEqual(state.session_id, session, "recovery starts a new thread");
+      assert.match(result.output, /session=recovered/);
+      session = state.session_id;
+    } else {
+      session ??= state.session_id;
+      assert.equal(state.session_id, session);
+    }
     if (turn === 1) {
       assert.deepEqual(state.verified_predicates, ["p1"]);
       writeFileSync(join(project, "part-1.txt"), "external regression\n");
@@ -70,7 +88,11 @@ try {
   const journal = readFileSync(join(data, "journal.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
   const turns = journal.filter(row => "ctx_hash" in row);
   assert.equal(turns.length, 5);
-  assert.ok(turns.slice(1).every(row => row.session_reused));
+  assert.deepEqual(turns.map(row => row.session_reused), [false, true, false, true, true]);
+  assert.equal(turns.filter(row => row.session_recovery).length, 1);
+  assert.equal(turns[2].session_recovery.lost_session_id, BOGUS);
+  assert.equal(turns[2].session_recovery.reason, "session_missing");
+  assert.ok(turns.every(row => row.continuity === "resume"));
   assert.equal(turns[1].progress, false);
   assert.ok(turns[1].rejected.some((r: { kind: string }) => r.kind === "acceptance_regressed"));
   assert.equal(run("status").code, 0);
@@ -84,7 +106,7 @@ try {
   assert.equal(readState().stop.reason, "acceptance_regressed");
   assert.equal(run("status").code, 3);
   assert.match(run("view").output, /\[ \] \*\*p1\*\*/);
-  console.log("live smoke passed: five turns, process restarts, regression repair, budget-edge completion, stale-success rejection");
+  console.log("live smoke passed: five turns, process restarts, regression repair, lost-thread recovery, budget-edge completion, stale-success rejection");
 } finally {
   rmSync(project, { recursive: true, force: true });
 }

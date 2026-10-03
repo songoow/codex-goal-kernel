@@ -6,7 +6,8 @@ import { GoalStore } from "./store.ts";
 import { sha256File } from "./hash.ts";
 import { nowIso } from "./fsutil.ts";
 import { renderView } from "./view.ts";
-import { goalFingerprint } from "./invariants.ts";
+import { continuityOf, goalFingerprint, tokensUsed } from "./invariants.ts";
+import { CONTINUITY_MODES } from "./types.ts";
 import type { Goal, KernelState } from "./types.ts";
 
 /**
@@ -31,6 +32,8 @@ const USAGE = `codex-goal — minimal deterministic long-horizon goal kernel
 
 The spec file is JSON:
   { "goal_id": "g", "objective": "...", "predicates": [...], "policy": {...} }
+policy: max_turns, max_idle_turns (required); continuity "resume"|"fresh",
+        max_total_tokens, max_wallclock_ms (optional). Absent continuity means resume.
 `;
 
 interface Options {
@@ -181,6 +184,12 @@ function init(options: Options): number {
   for (const value of [spec.policy?.max_turns, spec.policy?.max_idle_turns]) {
     if (!Number.isSafeInteger(value) || value < 1) throw new Error("policy limits must be positive integers");
   }
+  for (const [name, value] of [["max_total_tokens", spec.policy.max_total_tokens], ["max_wallclock_ms", spec.policy.max_wallclock_ms]] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error(`policy.${name} must be a positive integer when present`);
+  }
+  if (spec.policy.continuity !== undefined && !(CONTINUITY_MODES as readonly string[]).includes(spec.policy.continuity)) {
+    throw new Error(`policy.continuity must be one of ${CONTINUITY_MODES.join(", ")}`);
+  }
   if (!Array.isArray(spec.predicates) || !spec.predicates.length) throw new Error("spec requires acceptance predicates");
   const ids = new Set<string>();
   for (const predicate of spec.predicates) {
@@ -196,7 +205,7 @@ function init(options: Options): number {
     if (v.kind === "file_sha256" && !/^[0-9a-f]{64}$/.test(v.sha256)) throw new Error(`invalid digest for ${predicate.id}`);
   }
   const { goal_hash } = goalStore.initGoal(spec);
-  process.stdout.write(`initialized ${spec.goal_id}\n  goal hash: ${goal_hash}\n  data: ${goalStore.goalDir}\n`);
+  process.stdout.write(`initialized ${spec.goal_id}\n  goal hash: ${goal_hash}\n  continuity: ${continuityOf(spec)}\n  data: ${goalStore.goalDir}\n`);
   return 0;
 }
 
@@ -211,7 +220,7 @@ async function run(options: Options): Promise<number> {
   for (let turn = 0; turn < Math.max(1, options.turns); turn += 1) {
     const result = await kernel.runOneTurn();
     process.stdout.write(
-      `turn ${result.turn_index}: verified=[${result.verified.join(",")}] claimed=[${result.claimed.join(",")}] new=[${result.admitted_todos.join(",")}] progress=${result.progress ? "yes" : "no"}\n`,
+      `turn ${result.turn_index}: session=${result.session ?? "none"} verified=[${result.verified.join(",")}] claimed=[${result.claimed.join(",")}] new=[${result.admitted_todos.join(",")}] progress=${result.progress ? "yes" : "no"}\n`,
     );
     for (const rejection of result.rejected) {
       process.stdout.write(`  rejected ${rejection.kind}: ${rejection.detail}\n`);
@@ -236,8 +245,11 @@ function status(options: Options): number {
   const goal = goalStore.readGoal();
   const state = goalStore.readState();
   const satisfied = new Set(state.verified_predicates);
-  process.stdout.write(`${goal.goal_id}  status=${state.status}  turns=${state.turn_count}/${goal.policy.max_turns}  idle=${state.no_progress_streak}/${goal.policy.max_idle_turns}\n`);
-  process.stdout.write(`tokens in=${state.usage_total.input_tokens} cached=${state.usage_total.cached_input_tokens} out=${state.usage_total.output_tokens}\n`);
+  process.stdout.write(`${goal.goal_id}  status=${state.status}  continuity=${continuityOf(goal)}  turns=${state.turn_count}/${goal.policy.max_turns}  idle=${state.no_progress_streak}/${goal.policy.max_idle_turns}\n`);
+  const budget = goal.policy.max_total_tokens !== undefined ? ` budget=${tokensUsed(state)}/${goal.policy.max_total_tokens}` : "";
+  const clock = goal.policy.max_wallclock_ms !== undefined ? ` wallclock_budget_ms=${goal.policy.max_wallclock_ms} started_at=${state.started_at ?? "-"}` : "";
+  process.stdout.write(`tokens in=${state.usage_total.input_tokens} cached=${state.usage_total.cached_input_tokens} out=${state.usage_total.output_tokens}${budget}${clock}\n`);
+  process.stdout.write(`session=${state.session_id ?? "-"}\n`);
   for (const predicate of goal.predicates) {
     process.stdout.write(`  [${satisfied.has(predicate.id) ? "x" : " "}] ${predicate.id} ${predicate.statement}\n`);
   }
